@@ -1,0 +1,276 @@
+# ragnarhub.py
+# RagnarHub: engine install/version/projects launcher
+# deps: pygame only in projects, but hub itself uses stdlib only
+
+from __future__ import annotations
+import os, sys, json, shutil, zipfile, urllib.request
+from pathlib import Path
+from tkinter import Tk, ttk, messagebox, StringVar, filedialog
+
+DATA = Path("RagnarHubData")
+ENGINES = DATA / "engines"
+PROJECTS = DATA / "projects"
+SETTINGS = DATA / "settings.json"
+
+# Your link (may fail / return empty)
+REMOTE_ENGINE_URL = "https://raw.githubusercontent.com/ragnar152743/ragnarengine/refs/heads/main/ragnar.r.sharp"
+
+DEFAULT_VER = "v1"
+
+def ensure():
+    DATA.mkdir(exist_ok=True)
+    ENGINES.mkdir(exist_ok=True)
+    PROJECTS.mkdir(exist_ok=True)
+
+def load_settings():
+    if SETTINGS.exists():
+        try: return json.loads(SETTINGS.read_text(encoding="utf-8"))
+        except Exception: return {}
+    return {}
+
+def save_settings(s: dict):
+    SETTINGS.write_text(json.dumps(s, indent=2), encoding="utf-8")
+
+def eng_dir(ver: str) -> Path:
+    return ENGINES / ver
+
+def installed_versions():
+    if not ENGINES.exists(): return []
+    return sorted([p.name for p in ENGINES.iterdir() if p.is_dir()])
+
+def download_text(url: str) -> str:
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = r.read()
+        return data.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+def install_engine_from_url(ver: str, url: str) -> bool:
+    d = eng_dir(ver)
+    if d.exists(): shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+
+    txt = download_text(url)
+    if not txt:
+        return False
+
+    # Save as engine module file (whatever you host). We store it as ragnarengine.py
+    (d / "ragnarengine.py").write_text(txt + "\n", encoding="utf-8")
+    (d / "engine.json").write_text(json.dumps({"version": ver, "url": url}, indent=2), encoding="utf-8")
+    return True
+
+def install_engine_local_copy(ver: str):
+    # fallback: copy local ragnarengine.py next to hub into engine folder
+    src = Path("ragnarengine.py")
+    if not src.exists():
+        raise RuntimeError("Local ragnarengine.py introuvable (mets-le à côté du hub).")
+    d = eng_dir(ver)
+    if d.exists(): shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, d / "ragnarengine.py")
+    (d / "engine.json").write_text(json.dumps({"version": ver, "url": "local"}, indent=2), encoding="utf-8")
+
+def create_project(name: str, ver: str):
+    p = PROJECTS / name
+    if p.exists():
+        raise RuntimeError("Projet déjà existant.")
+    p.mkdir(parents=True)
+
+    # copy engine module into project (portable)
+    shutil.copy2(eng_dir(ver) / "ragnarengine.py", p / "ragnarengine.py")
+
+    # default scene
+    scene = {
+        "name": name,
+        "selected_id": 1,
+        "entities": [
+            {"id": 1, "name": "Cube", "pos":[0,0,0], "rot":[0,0,0], "scale":[1,1,1], "mesh":"cube"}
+        ]
+    }
+    (p / "scene.json").write_text(json.dumps(scene, indent=2), encoding="utf-8")
+
+    # launchers
+    (p / "editor.py").write_text(
+        "import ragnarengine as re\nre.run_editor(project_root='.')\n", encoding="utf-8"
+    )
+    (p / "game.py").write_text(
+        "import ragnarengine as re\nre.run_game(project_root='.')\n", encoding="utf-8"
+    )
+
+def run_py(path: Path):
+    os.spawnv(os.P_NOWAIT, sys.executable, [sys.executable, str(path)])
+
+class Hub:
+    def __init__(self, root: Tk):
+        self.root = root
+        root.title("Ragnar Hub (Real from-scratch engine)")
+        root.geometry("900x520")
+
+        ensure()
+        self.s = load_settings()
+        self.default_ver = self.s.get("default_ver", DEFAULT_VER)
+
+        self.status = StringVar(value="Ready.")
+        nb = ttk.Notebook(root)
+        self.t_eng = ttk.Frame(nb)
+        self.t_proj = ttk.Frame(nb)
+        nb.add(self.t_eng, text="Engines")
+        nb.add(self.t_proj, text="Projects")
+        nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ttk.Label(root, textvariable=self.status).pack(anchor="w", padx=12)
+
+        self._engines_ui()
+        self._projects_ui()
+        self.refresh()
+
+    def set_status(self, t): self.status.set(t); self.root.update_idletasks()
+
+    def _engines_ui(self):
+        left = ttk.Frame(self.t_eng); left.pack(side="left", fill="both", expand=True, padx=(0,10), pady=10)
+        right = ttk.Frame(self.t_eng); right.pack(side="right", fill="y", padx=(10,0), pady=10)
+
+        ttk.Label(left, text="Installed engine versions").pack(anchor="w")
+        self.eng = ttk.Treeview(left, columns=("ver","default"), show="headings", height=14)
+        self.eng.heading("ver", text="VERSION")
+        self.eng.heading("default", text="DEFAULT")
+        self.eng.column("ver", width=200)
+        self.eng.column("default", width=120)
+        self.eng.pack(fill="both", expand=True, pady=(8,0))
+
+        ttk.Label(right, text="Actions").pack(anchor="w")
+        ttk.Button(right, text="Install from GitHub URL", command=self.install_remote).pack(fill="x", pady=6)
+        ttk.Button(right, text="Install from local ragnarengine.py", command=self.install_local).pack(fill="x", pady=6)
+        ttk.Button(right, text="Set default", command=self.set_default).pack(fill="x", pady=6)
+        ttk.Button(right, text="Refresh", command=self.refresh).pack(fill="x", pady=6)
+
+        ttk.Separator(right).pack(fill="x", pady=12)
+        ttk.Label(right, text="Note: if your URL returns empty,\nuse local install.", foreground="#444").pack(anchor="w")
+
+    def _projects_ui(self):
+        top = ttk.Frame(self.t_proj); top.pack(fill="x", pady=10)
+        ttk.Label(top, text="Projects").pack(side="left")
+
+        btns = ttk.Frame(top); btns.pack(side="right")
+        ttk.Button(btns, text="Create", command=self.create).pack(side="left", padx=5)
+        ttk.Button(btns, text="Open folder", command=self.open_folder).pack(side="left", padx=5)
+        ttk.Button(btns, text="Run Editor", command=self.run_editor).pack(side="left", padx=5)
+        ttk.Button(btns, text="Run Game", command=self.run_game).pack(side="left", padx=5)
+        ttk.Button(btns, text="Refresh", command=self.refresh).pack(side="left", padx=5)
+
+        self.proj = ttk.Treeview(self.t_proj, columns=("name","path"), show="headings", height=18)
+        self.proj.heading("name", text="NAME"); self.proj.column("name", width=220)
+        self.proj.heading("path", text="PATH"); self.proj.column("path", width=620)
+        self.proj.pack(fill="both", expand=True, pady=(0,10))
+
+    def refresh(self):
+        for i in self.eng.get_children(): self.eng.delete(i)
+        for ver in installed_versions():
+            d = "DEFAULT" if ver == self.default_ver else ""
+            self.eng.insert("", "end", values=(ver, d))
+
+        for i in self.proj.get_children(): self.proj.delete(i)
+        for p in PROJECTS.iterdir():
+            if p.is_dir() and (p/"scene.json").exists():
+                self.proj.insert("", "end", values=(p.name, str(p)))
+
+    def selected_engine(self):
+        sel = self.eng.selection()
+        if not sel: return None
+        return self.eng.item(sel[0], "values")[0]
+
+    def selected_project_path(self):
+        sel = self.proj.selection()
+        if not sel: return None
+        return Path(self.proj.item(sel[0], "values")[1])
+
+    def install_remote(self):
+        ver = "v" + str(len(installed_versions()) + 1)
+        self.set_status(f"Downloading engine to {ver}...")
+        ok = install_engine_from_url(ver, REMOTE_ENGINE_URL)
+        if not ok:
+            messagebox.showwarning("Download failed",
+                                   "Ton URL renvoie vide/erreur.\n"
+                                   "Astuce: utilise un vrai raw style:\n"
+                                   "https://raw.githubusercontent.com/<user>/<repo>/main/<file>\n\n"
+                                   "Sinon clique 'Install from local'.")
+            self.set_status("Ready.")
+            return
+        self.set_status("Installed ✅")
+        self.refresh()
+
+    def install_local(self):
+        try:
+            ver = "v" + str(len(installed_versions()) + 1)
+            self.set_status(f"Installing local engine to {ver}...")
+            install_engine_local_copy(ver)
+            self.set_status("Installed ✅")
+            self.refresh()
+        except Exception as e:
+            messagebox.showerror("Local install error", str(e))
+            self.set_status("Ready.")
+
+    def set_default(self):
+        ver = self.selected_engine()
+        if not ver:
+            messagebox.showwarning("Select", "Select an engine version.")
+            return
+        self.default_ver = ver
+        self.s["default_ver"] = ver
+        save_settings(self.s)
+        self.refresh()
+
+    def create(self):
+        if not installed_versions():
+            messagebox.showwarning("No engine", "Installe un moteur d'abord (Engines tab).")
+            return
+        name = filedialog.asksaveasfilename(initialdir=str(PROJECTS), title="Project name",
+                                            defaultextension="", filetypes=[("Folder", "*")])
+        # tkinter hack: we use filename as path, then convert to folder name
+        if not name: return
+        name = Path(name).name.strip()
+        if not name: return
+        safe = "".join(ch for ch in name if ch.isalnum() or ch in ("-","_"," ")).strip()
+        if not safe:
+            messagebox.showerror("Invalid", "Nom invalide."); return
+        try:
+            create_project(safe, self.default_ver)
+            self.refresh()
+        except Exception as e:
+            messagebox.showerror("Create error", str(e))
+
+    def open_folder(self):
+        p = self.selected_project_path()
+        if not p:
+            messagebox.showwarning("Select", "Select a project.")
+            return
+        if os.name == "nt":
+            os.startfile(p)
+        else:
+            messagebox.showinfo("Info", f"Project at: {p}")
+
+    def run_editor(self):
+        p = self.selected_project_path()
+        if not p:
+            messagebox.showwarning("Select", "Select a project.")
+            return
+        run_py(p / "editor.py")
+
+    def run_game(self):
+        p = self.selected_project_path()
+        if not p:
+            messagebox.showwarning("Select", "Select a project.")
+            return
+        run_py(p / "game.py")
+
+def main():
+    root = Tk()
+    style = ttk.Style()
+    try: style.theme_use("clam")
+    except Exception: pass
+    Hub(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
