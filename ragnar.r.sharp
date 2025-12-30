@@ -1,1 +1,329 @@
+# ragnarengine.py
+# RagnarEngine (from scratch) - software 3D engine + tiny editor
+# deps: pygame only -> pip install pygame
+
+from __future__ import annotations
+import json, math, os
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
+
+import pygame
+
+
+# -------------------- Math --------------------
+@dataclass
+class Vec3:
+    x: float; y: float; z: float
+    def __add__(self, o): return Vec3(self.x+o.x, self.y+o.y, self.z+o.z)
+    def __sub__(self, o): return Vec3(self.x-o.x, self.y-o.y, self.z-o.z)
+    def __mul__(self, k: float): return Vec3(self.x*k, self.y*k, self.z*k)
+
+def rot_y(v: Vec3, a: float) -> Vec3:
+    c, s = math.cos(a), math.sin(a)
+    return Vec3(v.x*c + v.z*s, v.y, -v.x*s + v.z*c)
+
+def rot_x(v: Vec3, a: float) -> Vec3:
+    c, s = math.cos(a), math.sin(a)
+    return Vec3(v.x, v.y*c - v.z*s, v.y*s + v.z*c)
+
+def clamp(v, a, b): return a if v < a else b if v > b else v
+
+
+# -------------------- Engine data --------------------
+CUBE_VERTS = [
+    Vec3(-1,-1,-1), Vec3( 1,-1,-1), Vec3( 1, 1,-1), Vec3(-1, 1,-1),
+    Vec3(-1,-1, 1), Vec3( 1,-1, 1), Vec3( 1, 1, 1), Vec3(-1, 1, 1),
+]
+CUBE_EDGES = [
+    (0,1),(1,2),(2,3),(3,0),
+    (4,5),(5,6),(6,7),(7,4),
+    (0,4),(1,5),(2,6),(3,7)
+]
+
+@dataclass
+class Entity:
+    id: int
+    name: str
+    pos: Vec3 = field(default_factory=lambda: Vec3(0,0,0))
+    rot: Vec3 = field(default_factory=lambda: Vec3(0,0,0))  # radians
+    scale: Vec3 = field(default_factory=lambda: Vec3(1,1,1))
+    mesh: str = "cube"  # only cube for now
+
+@dataclass
+class Scene:
+    name: str = "Scene"
+    entities: List[Entity] = field(default_factory=list)
+    selected_id: Optional[int] = None
+
+
+# -------------------- Scene IO --------------------
+def load_scene(path: str) -> Scene:
+    data = json.loads(open(path, "r", encoding="utf-8").read())
+    s = Scene(name=data.get("name","Scene"))
+    for e in data.get("entities", []):
+        s.entities.append(Entity(
+            id=int(e["id"]),
+            name=e.get("name","Entity"),
+            pos=Vec3(*e.get("pos",[0,0,0])),
+            rot=Vec3(*e.get("rot",[0,0,0])),
+            scale=Vec3(*e.get("scale",[1,1,1])),
+            mesh=e.get("mesh","cube"),
+        ))
+    s.selected_id = data.get("selected_id")
+    return s
+
+def save_scene(scene: Scene, path: str) -> None:
+    data = {
+        "name": scene.name,
+        "selected_id": scene.selected_id,
+        "entities": [{
+            "id": e.id, "name": e.name,
+            "pos":[e.pos.x,e.pos.y,e.pos.z],
+            "rot":[e.rot.x,e.rot.y,e.rot.z],
+            "scale":[e.scale.x,e.scale.y,e.scale.z],
+            "mesh": e.mesh,
+        } for e in scene.entities]
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+# -------------------- Renderer (software) --------------------
+@dataclass
+class Camera:
+    pos: Vec3 = field(default_factory=lambda: Vec3(0,1.2,6))
+    yaw: float = math.pi
+    pitch: float = 0.0
+    fov: float = 75.0
+
+def project(v: Vec3, w: int, h: int, fov_deg: float) -> Optional[Tuple[int,int,float]]:
+    # simple perspective; returns (x,y,depth) or None if behind camera
+    if v.z <= 0.05:
+        return None
+    f = (w / 2) / math.tan(math.radians(fov_deg) / 2)
+    x = int(w/2 + (v.x * f) / v.z)
+    y = int(h/2 - (v.y * f) / v.z)
+    return (x, y, v.z)
+
+def world_to_cam(p: Vec3, cam: Camera) -> Vec3:
+    # translate
+    v = p - cam.pos
+    # rotate opposite camera
+    v = rot_y(v, -cam.yaw)
+    v = rot_x(v, -cam.pitch)
+    return v
+
+def draw_wire_cube(surface, cam: Camera, ent: Entity, color=(80,200,255)):
+    w, h = surface.get_width(), surface.get_height()
+
+    # build transformed vertices in world
+    verts_w = []
+    for v in CUBE_VERTS:
+        # scale
+        vv = Vec3(v.x*ent.scale.x, v.y*ent.scale.y, v.z*ent.scale.z)
+        # rotate entity (Y then X for simplicity)
+        vv = rot_y(vv, ent.rot.y)
+        vv = rot_x(vv, ent.rot.x)
+        # translate
+        vv = vv + ent.pos
+        verts_w.append(vv)
+
+    # to camera & project
+    pts = []
+    for vw in verts_w:
+        vc = world_to_cam(vw, cam)
+        pr = project(vc, w, h, cam.fov)
+        pts.append(pr)
+
+    # draw edges
+    for a,b in CUBE_EDGES:
+        pa, pb = pts[a], pts[b]
+        if pa is None or pb is None:
+            continue
+        pygame.draw.line(surface, color, (pa[0],pa[1]), (pb[0],pb[1]), 2)
+
+
+# -------------------- Tiny UI --------------------
+def ui_button(surface, rect, text, mouse, click) -> bool:
+    r = pygame.Rect(rect)
+    hover = r.collidepoint(mouse)
+    pygame.draw.rect(surface, (60,60,75) if not hover else (90,90,115), r, border_radius=10)
+    pygame.draw.rect(surface, (160,160,190), r, 2, border_radius=10)
+    font = pygame.font.SysFont("consolas", 18)
+    label = font.render(text, True, (240,240,250))
+    surface.blit(label, (r.x+10, r.y + (r.h-label.get_height())//2))
+    return hover and click
+
+def ui_label(surface, x, y, text):
+    font = pygame.font.SysFont("consolas", 16)
+    surface.blit(font.render(text, True, (230,230,240)), (x,y))
+
+
+# -------------------- Editor --------------------
+def run_editor(project_root: str = "."):
+    pygame.init()
+    pygame.font.init()
+    screen = pygame.display.set_mode((1100, 700))
+    pygame.display.set_caption("RagnarEngine Editor (from scratch)")
+    clock = pygame.time.Clock()
+
+    scene_path = os.path.join(project_root, "scene.json")
+    if os.path.exists(scene_path):
+        scene = load_scene(scene_path)
+    else:
+        scene = Scene(name="NewScene", entities=[Entity(id=1, name="Cube", pos=Vec3(0,0,0))])
+
+    cam = Camera()
+    next_id = max([e.id for e in scene.entities], default=0) + 1
+    paused_mouse = False
+    pygame.mouse.set_visible(True)
+
+    while True:
+        dt = clock.tick(120) / 1000.0
+        mouse = pygame.mouse.get_pos()
+        click = False
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit()
+                return
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                click = True
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    return
+                if ev.key == pygame.K_F5:
+                    save_scene(scene, scene_path)
+
+        keys = pygame.key.get_pressed()
+        # simple camera controls (WASD + arrows)
+        sp = 6.0 * (2.0 if keys[pygame.K_LSHIFT] else 1.0)
+        if keys[pygame.K_a]: cam.pos.x -= sp*dt
+        if keys[pygame.K_d]: cam.pos.x += sp*dt
+        if keys[pygame.K_w]: cam.pos.z -= sp*dt
+        if keys[pygame.K_s]: cam.pos.z += sp*dt
+        if keys[pygame.K_q]: cam.pos.y -= sp*dt
+        if keys[pygame.K_e]: cam.pos.y += sp*dt
+
+        if keys[pygame.K_LEFT]: cam.yaw += 1.6*dt
+        if keys[pygame.K_RIGHT]: cam.yaw -= 1.6*dt
+        if keys[pygame.K_UP]: cam.pitch += 1.2*dt
+        if keys[pygame.K_DOWN]: cam.pitch -= 1.2*dt
+        cam.pitch = clamp(cam.pitch, -1.2, 1.2)
+
+        screen.fill((12,12,16))
+
+        # viewport (right side)
+        viewport = pygame.Rect(250, 0, 850, 700)
+        pygame.draw.rect(screen, (18,18,24), viewport)
+
+        # draw scene
+        for e in scene.entities:
+            col = (255,210,80) if e.id == scene.selected_id else (80,200,255)
+            draw_wire_cube(screen.subsurface(viewport), cam, e, color=col)
+
+        # left panel
+        pygame.draw.rect(screen, (20,20,28), (0,0,250,700))
+        ui_label(screen, 12, 12, f"Scene: {scene.name}")
+        ui_label(screen, 12, 36, f"Entities: {len(scene.entities)}")
+        ui_label(screen, 12, 60, "F5 = Save scene.json")
+
+        if ui_button(screen, (12, 90, 226, 44), "Add Cube", mouse, click):
+            scene.entities.append(Entity(id=next_id, name=f"Cube{next_id}", pos=Vec3(0,0,0)))
+            scene.selected_id = next_id
+            next_id += 1
+
+        if ui_button(screen, (12, 140, 226, 44), "Delete Selected", mouse, click):
+            if scene.selected_id is not None:
+                scene.entities = [e for e in scene.entities if e.id != scene.selected_id]
+                scene.selected_id = None
+
+        # hierarchy list
+        ui_label(screen, 12, 210, "Hierarchy:")
+        y = 235
+        for e in scene.entities:
+            r = pygame.Rect(12, y, 226, 30)
+            hover = r.collidepoint(mouse)
+            pygame.draw.rect(screen, (50,50,65) if not hover else (75,75,95), r, border_radius=8)
+            if click and hover:
+                scene.selected_id = e.id
+            ui_label(screen, 20, y+7, f"[{e.id}] {e.name}")
+            y += 36
+
+        # inspector
+        ui_label(screen, 12, 560, "Inspector:")
+        sel = next((x for x in scene.entities if x.id == scene.selected_id), None)
+        if sel:
+            ui_label(screen, 12, 585, f"Name: {sel.name}")
+            ui_label(screen, 12, 605, f"Pos:  {sel.pos.x:.2f}, {sel.pos.y:.2f}, {sel.pos.z:.2f}")
+            ui_label(screen, 12, 625, f"RotY: {math.degrees(sel.rot.y):.1f} deg")
+            ui_label(screen, 12, 645, f"Scale:{sel.scale.x:.2f}")
+
+            # quick edit keys for selected (simple & works)
+            if keys[pygame.K_i]: sel.pos.z -= 4.0*dt
+            if keys[pygame.K_k]: sel.pos.z += 4.0*dt
+            if keys[pygame.K_j]: sel.pos.x -= 4.0*dt
+            if keys[pygame.K_l]: sel.pos.x += 4.0*dt
+            if keys[pygame.K_u]: sel.pos.y += 4.0*dt
+            if keys[pygame.K_o]: sel.pos.y -= 4.0*dt
+            if keys[pygame.K_r]: sel.rot.y += 2.0*dt
+            if keys[pygame.K_t]: sel.rot.y -= 2.0*dt
+
+            ui_label(screen, 12, 670, "Move: IJKL U/O | Rot: R/T")
+        else:
+            ui_label(screen, 12, 585, "No selection")
+
+        pygame.display.flip()
+
+
+# -------------------- Game runtime --------------------
+def run_game(project_root: str = "."):
+    pygame.init()
+    pygame.font.init()
+    screen = pygame.display.set_mode((1100, 700))
+    pygame.display.set_caption("RagnarEngine Game (from scratch)")
+    clock = pygame.time.Clock()
+
+    scene_path = os.path.join(project_root, "scene.json")
+    scene = load_scene(scene_path) if os.path.exists(scene_path) else Scene(entities=[Entity(id=1, name="Cube")])
+
+    cam = Camera()
+    pygame.mouse.set_visible(False)
+    pygame.event.set_grab(True)
+    pygame.mouse.get_rel()
+
+    while True:
+        dt = clock.tick(120) / 1000.0
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); return
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                pygame.quit(); return
+
+        mx, my = pygame.mouse.get_rel()
+        cam.yaw -= mx * 0.004
+        cam.pitch -= my * 0.004
+        cam.pitch = clamp(cam.pitch, -1.2, 1.2)
+
+        keys = pygame.key.get_pressed()
+        sp = 7.0 * (2.0 if keys[pygame.K_LSHIFT] else 1.0)
+        if keys[pygame.K_w]: cam.pos.z -= sp*dt
+        if keys[pygame.K_s]: cam.pos.z += sp*dt
+        if keys[pygame.K_a]: cam.pos.x -= sp*dt
+        if keys[pygame.K_d]: cam.pos.x += sp*dt
+        if keys[pygame.K_SPACE]: cam.pos.y += sp*dt
+        if keys[pygame.K_LCTRL]: cam.pos.y -= sp*dt
+
+        screen.fill((10,10,14))
+        # spin cubes a bit so it's alive
+        for e in scene.entities:
+            e.rot.y += 0.8 * dt
+            draw_wire_cube(screen, cam, e, color=(80,200,255))
+
+        # fps
+        fps = clock.get_fps()
+        font = pygame.font.SysFont("consolas", 16)
+        screen.blit(font.render(f"FPS: {fps:5.1f}  ESC quit", True, (230,230,240)), (10,10))
+        pygame.display.flip()
 
