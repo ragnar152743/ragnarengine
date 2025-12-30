@@ -1,35 +1,195 @@
-# ragnarengine.py
-# RagnarEngine (from scratch) - software 3D engine + tiny editor
-# deps: pygame only -> pip install pygame
+
+# RagnarEngine (from scratch) - Python V2
+# - Software 3D renderer (wireframe + optional filled triangles with z-buffer)
+# - Editor: hierarchy, inspector, move with arrows, AZERTY/QWERTY, keybinds
+# - встроенный code editor (edit .rsharp scripts)
+# - R# (rsharp): ultra-simplified C#-like scripting (interpreted)
+#
+# Dependencies: pygame
+#   pip install pygame
+#
+# Run:
+#   python ragnarengine.py --editor <project_dir>
+#   python ragnarengine.py --game <project_dir>
 
 from __future__ import annotations
-import json, math, os
+import argparse
+import json
+import math
+import os
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pygame
 
+# -------------------------- Utilities --------------------------
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
 
-# -------------------- Math --------------------
+def load_json(path: str, default: Any):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def save_json(path: str, data: Any):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+# -------------------------- Math --------------------------
 @dataclass
 class Vec3:
-    x: float; y: float; z: float
-    def __add__(self, o): return Vec3(self.x+o.x, self.y+o.y, self.z+o.z)
-    def __sub__(self, o): return Vec3(self.x-o.x, self.y-o.y, self.z-o.z)
-    def __mul__(self, k: float): return Vec3(self.x*k, self.y*k, self.z*k)
-
-def rot_y(v: Vec3, a: float) -> Vec3:
-    c, s = math.cos(a), math.sin(a)
-    return Vec3(v.x*c + v.z*s, v.y, -v.x*s + v.z*c)
+    x: float
+    y: float
+    z: float
+    def __add__(self, o): return Vec3(self.x + o.x, self.y + o.y, self.z + o.z)
+    def __sub__(self, o): return Vec3(self.x - o.x, self.y - o.y, self.z - o.z)
+    def __mul__(self, k: float): return Vec3(self.x * k, self.y * k, self.z * k)
 
 def rot_x(v: Vec3, a: float) -> Vec3:
     c, s = math.cos(a), math.sin(a)
-    return Vec3(v.x, v.y*c - v.z*s, v.y*s + v.z*c)
+    return Vec3(v.x, v.y * c - v.z * s, v.y * s + v.z * c)
 
-def clamp(v, a, b): return a if v < a else b if v > b else v
+def rot_y(v: Vec3, a: float) -> Vec3:
+    c, s = math.cos(a), math.sin(a)
+    return Vec3(v.x * c + v.z * s, v.y, -v.x * s + v.z * c)
 
+def rot_z(v: Vec3, a: float) -> Vec3:
+    c, s = math.cos(a), math.sin(a)
+    return Vec3(v.x * c - v.y * s, v.x * s + v.y * c, v.z)
 
-# -------------------- Engine data --------------------
+def vdot(a: Vec3, b: Vec3) -> float:
+    return a.x*b.x + a.y*b.y + a.z*b.z
+
+def vcross(a: Vec3, b: Vec3) -> Vec3:
+    return Vec3(
+        a.y*b.z - a.z*b.y,
+        a.z*b.x - a.x*b.z,
+        a.x*b.y - a.y*b.x
+    )
+
+def vnorm(a: Vec3) -> Vec3:
+    l = math.sqrt(vdot(a,a)) or 1.0
+    return Vec3(a.x/l, a.y/l, a.z/l)
+
+# -------------------------- Scene --------------------------
+@dataclass
+class Entity:
+    id: int
+    name: str
+    pos: Vec3 = field(default_factory=lambda: Vec3(0,0,0))
+    rot: Vec3 = field(default_factory=lambda: Vec3(0,0,0))  # radians
+    scale: Vec3 = field(default_factory=lambda: Vec3(1,1,1))
+    mesh: str = "cube"
+    components: Dict[str, Any] = field(default_factory=dict)  # Controller, Script, etc.
+
+@dataclass
+class Scene:
+    name: str = "Scene"
+    entities: List[Entity] = field(default_factory=list)
+    selected_id: Optional[int] = None
+
+def scene_from_json(data: dict) -> Scene:
+    s = Scene(name=data.get("name","Scene"))
+    s.selected_id = data.get("selected_id")
+    for e in data.get("entities", []):
+        ent = Entity(
+            id=int(e.get("id", 0)),
+            name=e.get("name","Entity"),
+            pos=Vec3(*e.get("pos",[0,0,0])),
+            rot=Vec3(*e.get("rot",[0,0,0])),
+            scale=Vec3(*e.get("scale",[1,1,1])),
+            mesh=e.get("mesh","cube"),
+            components=e.get("components", {}) or {}
+        )
+        s.entities.append(ent)
+    return s
+
+def scene_to_json(scene: Scene) -> dict:
+    return {
+        "name": scene.name,
+        "selected_id": scene.selected_id,
+        "entities": [
+            {
+                "id": e.id, "name": e.name,
+                "pos":[e.pos.x,e.pos.y,e.pos.z],
+                "rot":[e.rot.x,e.rot.y,e.rot.z],
+                "scale":[e.scale.x,e.scale.y,e.scale.z],
+                "mesh": e.mesh,
+                "components": e.components
+            }
+            for e in scene.entities
+        ]
+    }
+
+def load_scene(path: str) -> Scene:
+    return scene_from_json(load_json(path, {"name":"Scene","entities":[]}))
+
+def save_scene(scene: Scene, path: str):
+    save_json(path, scene_to_json(scene))
+
+# -------------------------- Project settings --------------------------
+DEFAULT_PROJECT = {
+    "name": "MyGame",
+    "engine": "RagnarEnginePyV2",
+    "main_scene": "scene.json",
+    "input": {
+        "layout": "AUTO",   # AUTO | AZERTY | QWERTY
+        "bindings": {       # actions -> key names (pygame)
+            "Forward": "W",
+            "Back": "S",
+            "Left": "A",
+            "Right": "D",
+            "Up": "SPACE",
+            "Down": "LCTRL",
+            "RotateL": "LEFT",
+            "RotateR": "RIGHT",
+        }
+    },
+    "render": {
+        "mode": "WIRE",     # WIRE | FILL
+        "fov": 75.0
+    }
+}
+
+AZERTY_DEFAULT = {"Forward":"Z","Back":"S","Left":"Q","Right":"D"}
+QWERTY_DEFAULT = {"Forward":"W","Back":"S","Left":"A","Right":"D"}
+
+def detect_layout_guess() -> str:
+    # best-effort guess: use locale; not perfect, so keep as fallback
+    import locale
+    loc = (locale.getdefaultlocale() or ("",""))[0] or ""
+    loc = loc.lower()
+    if "fr" in loc:
+        return "AZERTY"
+    return "QWERTY"
+
+def build_bindings(project: dict) -> Dict[str, int]:
+    layout = (project.get("input",{}).get("layout","AUTO") or "AUTO").upper()
+    bindings = dict(project.get("input",{}).get("bindings",{}) or {})
+    if layout == "AUTO":
+        layout = detect_layout_guess()
+    if layout == "AZERTY":
+        for k,v in AZERTY_DEFAULT.items():
+            bindings.setdefault(k, v)
+    elif layout == "QWERTY":
+        for k,v in QWERTY_DEFAULT.items():
+            bindings.setdefault(k, v)
+
+    out = {}
+    for action, key_name in bindings.items():
+        try:
+            out[action] = pygame.key.key_code(key_name.lower())
+        except Exception:
+            # allow special names like LEFT, RIGHT, SPACE
+            try:
+                out[action] = pygame.key.key_code(key_name)
+            except Exception:
+                out[action] = pygame.K_UNKNOWN
+    return out
+
+# -------------------------- Mesh: Cube --------------------------
 CUBE_VERTS = [
     Vec3(-1,-1,-1), Vec3( 1,-1,-1), Vec3( 1, 1,-1), Vec3(-1, 1,-1),
     Vec3(-1,-1, 1), Vec3( 1,-1, 1), Vec3( 1, 1, 1), Vec3(-1, 1, 1),
@@ -39,267 +199,813 @@ CUBE_EDGES = [
     (4,5),(5,6),(6,7),(7,4),
     (0,4),(1,5),(2,6),(3,7)
 ]
+CUBE_TRIS = [
+    (0,1,2),(0,2,3),
+    (4,6,5),(4,7,6),
+    (0,4,5),(0,5,1),
+    (1,5,6),(1,6,2),
+    (2,6,7),(2,7,3),
+    (3,7,4),(3,4,0),
+]
 
-@dataclass
-class Entity:
-    id: int
-    name: str
-    pos: Vec3 = field(default_factory=lambda: Vec3(0,0,0))
-    rot: Vec3 = field(default_factory=lambda: Vec3(0,0,0))  # radians
-    scale: Vec3 = field(default_factory=lambda: Vec3(1,1,1))
-    mesh: str = "cube"  # only cube for now
-
-@dataclass
-class Scene:
-    name: str = "Scene"
-    entities: List[Entity] = field(default_factory=list)
-    selected_id: Optional[int] = None
-
-
-# -------------------- Scene IO --------------------
-def load_scene(path: str) -> Scene:
-    data = json.loads(open(path, "r", encoding="utf-8").read())
-    s = Scene(name=data.get("name","Scene"))
-    for e in data.get("entities", []):
-        s.entities.append(Entity(
-            id=int(e["id"]),
-            name=e.get("name","Entity"),
-            pos=Vec3(*e.get("pos",[0,0,0])),
-            rot=Vec3(*e.get("rot",[0,0,0])),
-            scale=Vec3(*e.get("scale",[1,1,1])),
-            mesh=e.get("mesh","cube"),
-        ))
-    s.selected_id = data.get("selected_id")
-    return s
-
-def save_scene(scene: Scene, path: str) -> None:
-    data = {
-        "name": scene.name,
-        "selected_id": scene.selected_id,
-        "entities": [{
-            "id": e.id, "name": e.name,
-            "pos":[e.pos.x,e.pos.y,e.pos.z],
-            "rot":[e.rot.x,e.rot.y,e.rot.z],
-            "scale":[e.scale.x,e.scale.y,e.scale.z],
-            "mesh": e.mesh,
-        } for e in scene.entities]
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-# -------------------- Renderer (software) --------------------
+# -------------------------- Camera + Projection --------------------------
 @dataclass
 class Camera:
     pos: Vec3 = field(default_factory=lambda: Vec3(0,1.2,6))
     yaw: float = math.pi
     pitch: float = 0.0
-    fov: float = 75.0
-
-def project(v: Vec3, w: int, h: int, fov_deg: float) -> Optional[Tuple[int,int,float]]:
-    # simple perspective; returns (x,y,depth) or None if behind camera
-    if v.z <= 0.05:
-        return None
-    f = (w / 2) / math.tan(math.radians(fov_deg) / 2)
-    x = int(w/2 + (v.x * f) / v.z)
-    y = int(h/2 - (v.y * f) / v.z)
-    return (x, y, v.z)
 
 def world_to_cam(p: Vec3, cam: Camera) -> Vec3:
-    # translate
     v = p - cam.pos
-    # rotate opposite camera
     v = rot_y(v, -cam.yaw)
     v = rot_x(v, -cam.pitch)
     return v
 
-def draw_wire_cube(surface, cam: Camera, ent: Entity, color=(80,200,255)):
-    w, h = surface.get_width(), surface.get_height()
+def project(v: Vec3, w: int, h: int, fov_deg: float) -> Optional[Tuple[int,int,float]]:
+    if v.z <= 0.05:
+        return None
+    f = (w/2) / math.tan(math.radians(fov_deg)/2)
+    x = int(w/2 + (v.x * f)/v.z)
+    y = int(h/2 - (v.y * f)/v.z)
+    return (x,y,v.z)
 
-    # build transformed vertices in world
-    verts_w = []
+# -------------------------- Software raster (filled) --------------------------
+def tri_bbox(p0, p1, p2, w, h):
+    minx = max(0, min(p0[0], p1[0], p2[0]))
+    maxx = min(w-1, max(p0[0], p1[0], p2[0]))
+    miny = max(0, min(p0[1], p1[1], p2[1]))
+    maxy = min(h-1, max(p0[1], p1[1], p2[1]))
+    return minx, miny, maxx, maxy
+
+def edgef(a, b, c):
+    return (c[0]-a[0])*(b[1]-a[1]) - (c[1]-a[1])*(b[0]-a[0])
+
+def draw_filled_triangle(surf, zbuf, p0, p1, p2, color):
+    w, h = surf.get_width(), surf.get_height()
+    minx, miny, maxx, maxy = tri_bbox(p0, p1, p2, w, h)
+    area = edgef(p0, p1, p2)
+    if area == 0:
+        return
+    # normalize so we can use same sign test
+    inv_area = 1.0 / area
+    for y in range(miny, maxy+1):
+        for x in range(minx, maxx+1):
+            p = (x, y)
+            w0 = edgef(p1, p2, p) * inv_area
+            w1 = edgef(p2, p0, p) * inv_area
+            w2 = edgef(p0, p1, p) * inv_area
+            if w0 >= 0 and w1 >= 0 and w2 >= 0:
+                z = w0*p0[2] + w1*p1[2] + w2*p2[2]
+                idx = y*w + x
+                if z < zbuf[idx]:
+                    zbuf[idx] = z
+                    surf.set_at((x,y), color)
+
+# -------------------------- Render entity --------------------------
+def entity_world_verts(ent: Entity) -> List[Vec3]:
+    verts = []
     for v in CUBE_VERTS:
-        # scale
         vv = Vec3(v.x*ent.scale.x, v.y*ent.scale.y, v.z*ent.scale.z)
-        # rotate entity (Y then X for simplicity)
+        vv = rot_z(vv, ent.rot.z)
         vv = rot_y(vv, ent.rot.y)
         vv = rot_x(vv, ent.rot.x)
-        # translate
         vv = vv + ent.pos
-        verts_w.append(vv)
+        verts.append(vv)
+    return verts
 
-    # to camera & project
+def draw_entity_wire(surf, cam: Camera, ent: Entity, fov: float, color):
+    w, h = surf.get_width(), surf.get_height()
+    verts = entity_world_verts(ent)
     pts = []
-    for vw in verts_w:
+    for vw in verts:
         vc = world_to_cam(vw, cam)
-        pr = project(vc, w, h, cam.fov)
-        pts.append(pr)
-
-    # draw edges
+        pts.append(project(vc, w, h, fov))
     for a,b in CUBE_EDGES:
         pa, pb = pts[a], pts[b]
-        if pa is None or pb is None:
+        if pa is None or pb is None: 
             continue
-        pygame.draw.line(surface, color, (pa[0],pa[1]), (pb[0],pb[1]), 2)
+        pygame.draw.line(surf, color, (pa[0],pa[1]), (pb[0],pb[1]), 2)
 
+def draw_entity_fill(surf, cam: Camera, ent: Entity, fov: float, base_color=(80,200,255)):
+    w, h = surf.get_width(), surf.get_height()
+    zbuf = [1e9]*(w*h)
+    verts = entity_world_verts(ent)
 
-# -------------------- Tiny UI --------------------
-def ui_button(surface, rect, text, mouse, click) -> bool:
+    # simple light direction for shading
+    light = vnorm(Vec3(-0.4, 0.8, -0.3))
+
+    # triangles
+    for i0,i1,i2 in CUBE_TRIS:
+        v0w, v1w, v2w = verts[i0], verts[i1], verts[i2]
+        # face normal in world
+        n = vnorm(vcross(v1w - v0w, v2w - v0w))
+        ndotl = max(0.15, vdot(n, light))
+        col = (int(base_color[0]*ndotl), int(base_color[1]*ndotl), int(base_color[2]*ndotl))
+
+        p0 = project(world_to_cam(v0w, cam), w, h, fov)
+        p1 = project(world_to_cam(v1w, cam), w, h, fov)
+        p2 = project(world_to_cam(v2w, cam), w, h, fov)
+        if p0 is None or p1 is None or p2 is None:
+            continue
+        draw_filled_triangle(surf, zbuf, p0, p1, p2, col)
+
+# -------------------------- R# (rsharp) scripting --------------------------
+# Ultra simplified C#-ish language, interpreted
+# Supported:
+#  - // comment
+#  - let name = expr;
+#  - move("EntityName", dx, dy, dz);
+#  - rotY("EntityName", degrees);
+#  - if (cond) { ... }
+#  - key("Action")  -> bool
+# expr supports numbers, variables, + - * /, parentheses.
+#
+# Script runs every frame inside runtime.
+
+class RSharpRuntime:
+    def __init__(self, scene: Scene, keys_state, action_keys: Dict[str,int]):
+        self.scene = scene
+        self.vars: Dict[str, float] = {}
+        self.keys_state = keys_state
+        self.action_keys = action_keys
+
+    def get_entity(self, name: str) -> Optional[Entity]:
+        for e in self.scene.entities:
+            if e.name == name:
+                return e
+        return None
+
+    def fn_key(self, action: str) -> float:
+        k = self.action_keys.get(action, pygame.K_UNKNOWN)
+        return 1.0 if (k != pygame.K_UNKNOWN and self.keys_state[k]) else 0.0
+
+    def fn_move(self, name: str, dx: float, dy: float, dz: float):
+        e = self.get_entity(name)
+        if e:
+            e.pos.x += dx
+            e.pos.y += dy
+            e.pos.z += dz
+
+    def fn_rotY(self, name: str, deg: float):
+        e = self.get_entity(name)
+        if e:
+            e.rot.y += math.radians(deg)
+
+def tokenize_expr(s: str) -> List[str]:
+    tokens = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c.isspace():
+            i += 1
+        elif c in "+-*/()":
+            tokens.append(c); i += 1
+        elif c.isdigit() or c == ".":
+            j = i
+            while j < len(s) and (s[j].isdigit() or s[j] == "."):
+                j += 1
+            tokens.append(s[i:j]); i = j
+        elif c.isalpha() or c == "_":
+            j = i
+            while j < len(s) and (s[j].isalnum() or s[j] == "_"):
+                j += 1
+            tokens.append(s[i:j]); i = j
+        else:
+            # unknown char, skip
+            i += 1
+    return tokens
+
+def parse_expr(tokens: List[str], vars: Dict[str,float], rt: RSharpRuntime) -> float:
+    # Shunting-yard to RPN then eval (simple)
+    prec = {"+":1,"-":1,"*":2,"/":2}
+    out = []
+    op = []
+    for t in tokens:
+        if t.replace(".","",1).isdigit():
+            out.append(float(t))
+        elif t in prec:
+            while op and op[-1] in prec and prec[op[-1]] >= prec[t]:
+                out.append(op.pop())
+            op.append(t)
+        elif t == "(":
+            op.append(t)
+        elif t == ")":
+            while op and op[-1] != "(":
+                out.append(op.pop())
+            if op and op[-1] == "(":
+                op.pop()
+        else:
+            # variable
+            out.append(("var", t))
+    while op:
+        out.append(op.pop())
+
+    st = []
+    for it in out:
+        if isinstance(it, float):
+            st.append(it)
+        elif isinstance(it, tuple) and it[0] == "var":
+            st.append(float(vars.get(it[1], 0.0)))
+        elif it in "+-*/":
+            b = st.pop() if st else 0.0
+            a = st.pop() if st else 0.0
+            if it == "+": st.append(a+b)
+            elif it == "-": st.append(a-b)
+            elif it == "*": st.append(a*b)
+            elif it == "/": st.append(a/b if b != 0 else 0.0)
+    return st[-1] if st else 0.0
+
+def split_args(arg_str: str) -> List[str]:
+    args = []
+    cur = ""
+    depth = 0
+    in_str = False
+    i = 0
+    while i < len(arg_str):
+        c = arg_str[i]
+        if c == '"' and (i == 0 or arg_str[i-1] != "\\"):
+            in_str = not in_str
+            cur += c
+        elif not in_str:
+            if c == "(":
+                depth += 1; cur += c
+            elif c == ")":
+                depth -= 1; cur += c
+            elif c == "," and depth == 0:
+                args.append(cur.strip()); cur = ""
+            else:
+                cur += c
+        else:
+            cur += c
+        i += 1
+    if cur.strip():
+        args.append(cur.strip())
+    return args
+
+def eval_value(v: str, rt: RSharpRuntime) -> float | str:
+    v = v.strip()
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.replace(".","",1).isdigit():
+        return float(v)
+    # expression
+    return parse_expr(tokenize_expr(v), rt.vars, rt)
+
+def rsharp_execute(script_text: str, rt: RSharpRuntime, dt: float):
+    # dt is available as variable
+    rt.vars["dt"] = float(dt)
+
+    # preprocess: remove comments, keep braces for blocks
+    lines = []
+    for raw in script_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("//"):
+            continue
+        if "//" in line:
+            line = line.split("//",1)[0].strip()
+        if line:
+            lines.append(line)
+
+    # simple block execution using stack of program counters
+    i = 0
+    exec_stack = []
+    skip_until = None
+
+    def cond_eval(cond: str) -> bool:
+        # allow key("Action") in cond
+        cond = cond.strip()
+        # very tiny: replace key("X") with 1/0 then evaluate expr != 0
+        if 'key("' in cond:
+            # handle single key(...) for now
+            try:
+                start = cond.index('key("') + len('key("')
+                end = cond.index('")', start)
+                action = cond[start:end]
+                val = rt.fn_key(action)
+                cond2 = cond.replace(f'key("{action}")', str(val))
+                return parse_expr(tokenize_expr(cond2), rt.vars, rt) != 0.0
+            except Exception:
+                return False
+        return parse_expr(tokenize_expr(cond), rt.vars, rt) != 0.0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # handle block end
+        if line == "}":
+            if exec_stack:
+                i = exec_stack.pop()
+            else:
+                i += 1
+            continue
+
+        # if block
+        if line.startswith("if"):
+            # formats: if (cond) {  OR if (cond) {
+            try:
+                lpar = line.index("(")
+                rpar = line.rindex(")")
+                cond = line[lpar+1:rpar]
+                ok = cond_eval(cond)
+                # if line doesn't contain '{' on same line, next line must be '{'
+                if "{" in line:
+                    if ok:
+                        i += 1
+                    else:
+                        # skip until matching }
+                        depth = 0
+                        i += 1
+                        while i < len(lines):
+                            if "{" in lines[i]: depth += 1
+                            if lines[i] == "}":
+                                if depth == 0:
+                                    i += 1
+                                    break
+                                depth -= 1
+                            i += 1
+                else:
+                    # expect next line is "{"
+                    i += 1
+                    if i < len(lines) and lines[i] == "{":
+                        if ok:
+                            i += 1
+                        else:
+                            depth = 0
+                            i += 1
+                            while i < len(lines):
+                                if "{" in lines[i]: depth += 1
+                                if lines[i] == "}":
+                                    if depth == 0:
+                                        i += 1
+                                        break
+                                    depth -= 1
+                                i += 1
+                    else:
+                        # invalid
+                        continue
+                continue
+            except Exception:
+                i += 1
+                continue
+
+        # let assignment
+        if line.startswith("let "):
+            # let a = expr;
+            body = line[4:].rstrip(";").strip()
+            if "=" in body:
+                name, expr = body.split("=", 1)
+                name = name.strip()
+                expr = expr.strip()
+                rt.vars[name] = float(eval_value(expr, rt))
+            i += 1
+            continue
+
+        # function calls: move(...); rotY(...);
+        call = line.rstrip(";")
+        if call.startswith("move"):
+            inside = call[call.index("(")+1:call.rindex(")")]
+            args = split_args(inside)
+            if len(args) >= 4:
+                name = eval_value(args[0], rt)
+                dx = float(eval_value(args[1], rt))
+                dy = float(eval_value(args[2], rt))
+                dz = float(eval_value(args[3], rt))
+                if isinstance(name, str):
+                    rt.fn_move(name, dx, dy, dz)
+            i += 1
+            continue
+
+        if call.startswith("rotY"):
+            inside = call[call.index("(")+1:call.rindex(")")]
+            args = split_args(inside)
+            if len(args) >= 2:
+                name = eval_value(args[0], rt)
+                deg = float(eval_value(args[1], rt))
+                if isinstance(name, str):
+                    rt.fn_rotY(name, deg)
+            i += 1
+            continue
+
+        # unknown line -> ignore
+        i += 1
+
+# -------------------------- Editor UI --------------------------
+def ui_label(surface, x, y, text, size=16, color=(230,230,240)):
+    font = pygame.font.SysFont("consolas", size)
+    surface.blit(font.render(text, True, color), (x,y))
+
+def ui_button(surface, rect, text, mouse, click):
     r = pygame.Rect(rect)
     hover = r.collidepoint(mouse)
-    pygame.draw.rect(surface, (60,60,75) if not hover else (90,90,115), r, border_radius=10)
-    pygame.draw.rect(surface, (160,160,190), r, 2, border_radius=10)
+    pygame.draw.rect(surface, (60,60,78) if not hover else (90,90,120), r, border_radius=10)
+    pygame.draw.rect(surface, (170,170,210), r, 2, border_radius=10)
     font = pygame.font.SysFont("consolas", 18)
-    label = font.render(text, True, (240,240,250))
+    label = font.render(text, True, (245,245,255))
     surface.blit(label, (r.x+10, r.y + (r.h-label.get_height())//2))
     return hover and click
 
-def ui_label(surface, x, y, text):
-    font = pygame.font.SysFont("consolas", 16)
-    surface.blit(font.render(text, True, (230,230,240)), (x,y))
+# -------------------------- Code editor (very small) --------------------------
+class CodeEditor:
+    def __init__(self):
+        self.lines: List[str] = [""]
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self.filename: Optional[str] = None
+        self.dirty = False
 
+    def load(self, path: str):
+        self.filename = path
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read()
+            self.lines = txt.splitlines() or [""]
+        except Exception:
+            self.lines = [""]
+        self.cursor_x = 0
+        self.cursor_y = 0
+        self.dirty = False
 
-# -------------------- Editor --------------------
+    def save(self):
+        if not self.filename:
+            return
+        with open(self.filename, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.lines) + ("\n" if self.lines else ""))
+        self.dirty = False
+
+    def handle_key(self, ev: pygame.event.Event):
+        if ev.key == pygame.K_BACKSPACE:
+            if self.cursor_x > 0:
+                line = self.lines[self.cursor_y]
+                self.lines[self.cursor_y] = line[:self.cursor_x-1] + line[self.cursor_x:]
+                self.cursor_x -= 1
+                self.dirty = True
+            elif self.cursor_y > 0:
+                prev = self.lines[self.cursor_y-1]
+                cur = self.lines[self.cursor_y]
+                self.cursor_x = len(prev)
+                self.lines[self.cursor_y-1] = prev + cur
+                self.lines.pop(self.cursor_y)
+                self.cursor_y -= 1
+                self.dirty = True
+
+        elif ev.key == pygame.K_RETURN:
+            line = self.lines[self.cursor_y]
+            left, right = line[:self.cursor_x], line[self.cursor_x:]
+            self.lines[self.cursor_y] = left
+            self.lines.insert(self.cursor_y+1, right)
+            self.cursor_y += 1
+            self.cursor_x = 0
+            self.dirty = True
+
+        elif ev.key == pygame.K_TAB:
+            self.insert_text("    ")
+
+        elif ev.key == pygame.K_LEFT:
+            if self.cursor_x > 0:
+                self.cursor_x -= 1
+            elif self.cursor_y > 0:
+                self.cursor_y -= 1
+                self.cursor_x = len(self.lines[self.cursor_y])
+
+        elif ev.key == pygame.K_RIGHT:
+            if self.cursor_x < len(self.lines[self.cursor_y]):
+                self.cursor_x += 1
+            elif self.cursor_y < len(self.lines)-1:
+                self.cursor_y += 1
+                self.cursor_x = 0
+
+        elif ev.key == pygame.K_UP:
+            if self.cursor_y > 0:
+                self.cursor_y -= 1
+                self.cursor_x = min(self.cursor_x, len(self.lines[self.cursor_y]))
+
+        elif ev.key == pygame.K_DOWN:
+            if self.cursor_y < len(self.lines)-1:
+                self.cursor_y += 1
+                self.cursor_x = min(self.cursor_x, len(self.lines[self.cursor_y]))
+
+        elif ev.unicode and ev.unicode.isprintable():
+            self.insert_text(ev.unicode)
+
+    def insert_text(self, s: str):
+        line = self.lines[self.cursor_y]
+        self.lines[self.cursor_y] = line[:self.cursor_x] + s + line[self.cursor_x:]
+        self.cursor_x += len(s)
+        self.dirty = True
+
+    def draw(self, surface, rect: pygame.Rect):
+        pygame.draw.rect(surface, (14,14,18), rect)
+        pygame.draw.rect(surface, (90,90,115), rect, 2)
+        font = pygame.font.SysFont("consolas", 16)
+
+        # visible lines
+        x0, y0 = rect.x+10, rect.y+10
+        line_h = 18
+        max_lines = (rect.h - 20)//line_h
+
+        start = max(0, self.cursor_y - max_lines//2)
+        end = min(len(self.lines), start + max_lines)
+
+        for i in range(start, end):
+            ln = self.lines[i]
+            # small "highlight" for keywords
+            # (super simple: color whole line if starts with let/if/move/rotY)
+            col = (230,230,240)
+            if ln.strip().startswith("let "): col = (160,220,255)
+            if ln.strip().startswith("if "): col = (255,220,140)
+            if ln.strip().startswith("move"): col = (180,255,180)
+            if ln.strip().startswith("rotY"): col = (255,180,220)
+
+            num = font.render(f"{i+1:03d} ", True, (120,120,145))
+            txt = font.render(ln, True, col)
+            surface.blit(num, (x0, y0 + (i-start)*line_h))
+            surface.blit(txt, (x0+45, y0 + (i-start)*line_h))
+
+        # cursor
+        cy = self.cursor_y
+        if start <= cy < end:
+            cx = self.cursor_x
+            # compute pixel x using font size (approx)
+            pre = self.lines[cy][:cx]
+            cursor_px = x0+45 + font.size(pre)[0]
+            cursor_py = y0 + (cy-start)*line_h
+            pygame.draw.rect(surface, (240,240,255), (cursor_px, cursor_py, 2, line_h-2))
+
+        # footer
+        name = self.filename or "(no file)"
+        flag = "*" if self.dirty else ""
+        footer = pygame.font.SysFont("consolas", 14).render(f"{name}{flag}  |  Ctrl+S save  |  F2 back", True, (200,200,215))
+        surface.blit(footer, (rect.x+10, rect.bottom-20))
+
+# -------------------------- Editor main --------------------------
 def run_editor(project_root: str = "."):
     pygame.init()
     pygame.font.init()
-    screen = pygame.display.set_mode((1100, 700))
-    pygame.display.set_caption("RagnarEngine Editor (from scratch)")
-    clock = pygame.time.Clock()
 
-    scene_path = os.path.join(project_root, "scene.json")
-    if os.path.exists(scene_path):
-        scene = load_scene(scene_path)
-    else:
-        scene = Scene(name="NewScene", entities=[Entity(id=1, name="Cube", pos=Vec3(0,0,0))])
+    project_path = os.path.join(project_root, "project.json")
+    project = load_json(project_path, dict(DEFAULT_PROJECT))
+    # ensure defaults exist
+    for k,v in DEFAULT_PROJECT.items():
+        project.setdefault(k, v)
+
+    main_scene = os.path.join(project_root, project.get("main_scene","scene.json"))
+    scene = load_scene(main_scene) if os.path.exists(main_scene) else Scene(name="Scene", entities=[Entity(1,"Cube")])
+    if scene.selected_id is None and scene.entities:
+        scene.selected_id = scene.entities[0].id
 
     cam = Camera()
-    next_id = max([e.id for e in scene.entities], default=0) + 1
-    paused_mouse = False
-    pygame.mouse.set_visible(True)
+    w, h = 1200, 720
+    screen = pygame.display.set_mode((w,h))
+    pygame.display.set_caption("RagnarEngine Editor V2")
+    clock = pygame.time.Clock()
 
-    while True:
-        dt = clock.tick(120) / 1000.0
+    next_id = max([e.id for e in scene.entities], default=0) + 1
+
+    # editor modes
+    show_code = False
+    code = CodeEditor()
+    scripts_dir = os.path.join(project_root, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    script_file = os.path.join(scripts_dir, "main.rsharp")
+    if not os.path.exists(script_file):
+        with open(script_file, "w", encoding="utf-8") as f:
+            f.write('// R# example\n'
+                    'let speed = 2.5;\n'
+                    'if (key("Forward")) { move("Player", 0, 0, -speed*dt); }\n'
+                    'if (key("Back")) { move("Player", 0, 0, speed*dt); }\n'
+                    'if (key("Left")) { move("Player", -speed*dt, 0, 0); }\n'
+                    'if (key("Right")) { move("Player", speed*dt, 0, 0); }\n'
+                    'rotY("Cube", 35*dt);\n')
+    code.load(script_file)
+
+    # ensure a Player exists
+    if not any(e.name == "Player" for e in scene.entities):
+        scene.entities.append(Entity(id=next_id, name="Player", pos=Vec3(0,1.0,3), components={"Script":{"file":"scripts/main.rsharp"}}))
+        next_id += 1
+
+    # input bindings
+    action_keys = build_bindings(project)
+
+    def selected_entity() -> Optional[Entity]:
+        return next((e for e in scene.entities if e.id == scene.selected_id), None)
+
+    running = True
+    while running:
+        dt = clock.tick(120)/1000.0
+        fps = clock.get_fps()
         mouse = pygame.mouse.get_pos()
         click = False
 
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
-                pygame.quit()
-                return
-            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                running = False
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 click = True
-            if ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
-                    pygame.quit()
-                    return
-                if ev.key == pygame.K_F5:
-                    save_scene(scene, scene_path)
+            elif ev.type == pygame.KEYDOWN:
+                if show_code:
+                    # code editor shortcuts
+                    if (ev.key == pygame.K_s) and (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                        code.save()
+                    elif ev.key == pygame.K_F2:
+                        show_code = False
+                    else:
+                        code.handle_key(ev)
+                else:
+                    if ev.key == pygame.K_ESCAPE:
+                        running = False
+                    elif ev.key == pygame.K_F5:
+                        save_scene(scene, main_scene)
+                        save_json(project_path, project)
+                    elif ev.key == pygame.K_F2:
+                        show_code = True
 
-        keys = pygame.key.get_pressed()
-        # simple camera controls (WASD + arrows)
-        sp = 6.0 * (2.0 if keys[pygame.K_LSHIFT] else 1.0)
-        if keys[pygame.K_a]: cam.pos.x -= sp*dt
-        if keys[pygame.K_d]: cam.pos.x += sp*dt
-        if keys[pygame.K_w]: cam.pos.z -= sp*dt
-        if keys[pygame.K_s]: cam.pos.z += sp*dt
-        if keys[pygame.K_q]: cam.pos.y -= sp*dt
-        if keys[pygame.K_e]: cam.pos.y += sp*dt
+        screen.fill((10,10,14))
 
-        if keys[pygame.K_LEFT]: cam.yaw += 1.6*dt
-        if keys[pygame.K_RIGHT]: cam.yaw -= 1.6*dt
-        if keys[pygame.K_UP]: cam.pitch += 1.2*dt
-        if keys[pygame.K_DOWN]: cam.pitch -= 1.2*dt
-        cam.pitch = clamp(cam.pitch, -1.2, 1.2)
+        if show_code:
+            code.draw(screen, pygame.Rect(10,10,w-20,h-20))
+            pygame.display.flip()
+            continue
 
-        screen.fill((12,12,16))
-
-        # viewport (right side)
-        viewport = pygame.Rect(250, 0, 850, 700)
+        # Panels
+        left_w = 280
+        viewport = pygame.Rect(left_w, 0, w-left_w, h)
         pygame.draw.rect(screen, (18,18,24), viewport)
 
-        # draw scene
+        # Render mode
+        fov = float(project.get("render",{}).get("fov", 75.0))
+        mode = (project.get("render",{}).get("mode","WIRE") or "WIRE").upper()
+
+        # draw scene (viewport subsurface)
+        vp = screen.subsurface(viewport)
+        vp.fill((16,16,22))
+
         for e in scene.entities:
-            col = (255,210,80) if e.id == scene.selected_id else (80,200,255)
-            draw_wire_cube(screen.subsurface(viewport), cam, e, color=col)
+            col = (255,210,90) if e.id == scene.selected_id else (80,200,255)
+            if mode == "FILL":
+                draw_entity_fill(vp, cam, e, fov, base_color=col)
+                # outline
+                draw_entity_wire(vp, cam, e, fov, color=(10,10,10))
+            else:
+                draw_entity_wire(vp, cam, e, fov, color=col)
 
-        # left panel
-        pygame.draw.rect(screen, (20,20,28), (0,0,250,700))
-        ui_label(screen, 12, 12, f"Scene: {scene.name}")
-        ui_label(screen, 12, 36, f"Entities: {len(scene.entities)}")
-        ui_label(screen, 12, 60, "F5 = Save scene.json")
+        # Left panel UI
+        pygame.draw.rect(screen, (20,20,28), (0,0,left_w,h))
+        ui_label(screen, 12, 12, f"Project: {project.get('name','Game')}", 18)
+        ui_label(screen, 12, 40, f"Scene: {scene.name}  |  FPS: {fps:5.1f}")
+        ui_label(screen, 12, 62, "F5 Save  |  F2 Code  |  ESC Quit", 14, (200,200,215))
 
-        if ui_button(screen, (12, 90, 226, 44), "Add Cube", mouse, click):
+        if ui_button(screen, (12, 90, left_w-24, 42), "Add Cube", mouse, click):
             scene.entities.append(Entity(id=next_id, name=f"Cube{next_id}", pos=Vec3(0,0,0)))
             scene.selected_id = next_id
             next_id += 1
 
-        if ui_button(screen, (12, 140, 226, 44), "Delete Selected", mouse, click):
-            if scene.selected_id is not None:
-                scene.entities = [e for e in scene.entities if e.id != scene.selected_id]
-                scene.selected_id = None
+        if ui_button(screen, (12, 140, left_w-24, 42), "Delete Selected", mouse, click):
+            sel = selected_entity()
+            if sel:
+                scene.entities = [x for x in scene.entities if x.id != sel.id]
+                scene.selected_id = scene.entities[0].id if scene.entities else None
 
-        # hierarchy list
-        ui_label(screen, 12, 210, "Hierarchy:")
-        y = 235
+        # Toggle render mode
+        if ui_button(screen, (12, 190, left_w-24, 42), f"Render: {mode} (click)", mouse, click):
+            project.setdefault("render", {})
+            project["render"]["mode"] = "FILL" if mode == "WIRE" else "WIRE"
+
+        # Layout toggle
+        layout = (project.get("input",{}).get("layout","AUTO") or "AUTO").upper()
+        if ui_button(screen, (12, 240, left_w-24, 42), f"Keyboard: {layout} (click)", mouse, click):
+            nxt = {"AUTO":"AZERTY","AZERTY":"QWERTY","QWERTY":"AUTO"}[layout]
+            project.setdefault("input", {})
+            project["input"]["layout"] = nxt
+            action_keys = build_bindings(project)
+
+        ui_label(screen, 12, 300, "Hierarchy:", 16)
+        y = 325
         for e in scene.entities:
-            r = pygame.Rect(12, y, 226, 30)
+            r = pygame.Rect(12, y, left_w-24, 28)
             hover = r.collidepoint(mouse)
-            pygame.draw.rect(screen, (50,50,65) if not hover else (75,75,95), r, border_radius=8)
+            pygame.draw.rect(screen, (50,50,68) if not hover else (80,80,105), r, border_radius=8)
             if click and hover:
                 scene.selected_id = e.id
-            ui_label(screen, 20, y+7, f"[{e.id}] {e.name}")
-            y += 36
+            ui_label(screen, 20, y+6, f"[{e.id}] {e.name}", 14)
+            y += 34
+            if y > 520:
+                break
 
-        # inspector
-        ui_label(screen, 12, 560, "Inspector:")
-        sel = next((x for x in scene.entities if x.id == scene.selected_id), None)
+        # Inspector
+        ui_label(screen, 12, 560, "Inspector:", 16)
+        sel = selected_entity()
         if sel:
-            ui_label(screen, 12, 585, f"Name: {sel.name}")
-            ui_label(screen, 12, 605, f"Pos:  {sel.pos.x:.2f}, {sel.pos.y:.2f}, {sel.pos.z:.2f}")
-            ui_label(screen, 12, 625, f"RotY: {math.degrees(sel.rot.y):.1f} deg")
-            ui_label(screen, 12, 645, f"Scale:{sel.scale.x:.2f}")
+            ui_label(screen, 12, 585, f"Name: {sel.name}", 14)
+            ui_label(screen, 12, 605, f"Pos:  {sel.pos.x:.2f} {sel.pos.y:.2f} {sel.pos.z:.2f}", 14)
+            ui_label(screen, 12, 625, f"Rot:  {math.degrees(sel.rot.x):.0f} {math.degrees(sel.rot.y):.0f} {math.degrees(sel.rot.z):.0f}", 14)
+            ui_label(screen, 12, 645, f"Scale:{sel.scale.x:.2f} {sel.scale.y:.2f} {sel.scale.z:.2f}", 14)
 
-            # quick edit keys for selected (simple & works)
-            if keys[pygame.K_i]: sel.pos.z -= 4.0*dt
-            if keys[pygame.K_k]: sel.pos.z += 4.0*dt
-            if keys[pygame.K_j]: sel.pos.x -= 4.0*dt
-            if keys[pygame.K_l]: sel.pos.x += 4.0*dt
-            if keys[pygame.K_u]: sel.pos.y += 4.0*dt
-            if keys[pygame.K_o]: sel.pos.y -= 4.0*dt
-            if keys[pygame.K_r]: sel.rot.y += 2.0*dt
-            if keys[pygame.K_t]: sel.rot.y -= 2.0*dt
+            ui_label(screen, 12, 670, "Move selected with ARROWS + PgUp/PgDn", 14, (200,200,215))
 
-            ui_label(screen, 12, 670, "Move: IJKL U/O | Rot: R/T")
+            # Move with arrows (requested)
+            keys = pygame.key.get_pressed()
+            sp = 3.0 * dt
+            if keys[pygame.K_LEFT]:  sel.pos.x -= sp
+            if keys[pygame.K_RIGHT]: sel.pos.x += sp
+            if keys[pygame.K_UP]:    sel.pos.z -= sp
+            if keys[pygame.K_DOWN]:  sel.pos.z += sp
+            if keys[pygame.K_PAGEUP]:   sel.pos.y += sp
+            if keys[pygame.K_PAGEDOWN]: sel.pos.y -= sp
+
+            # rotate quick
+            if keys[pygame.K_COMMA]: sel.rot.y += 1.6*dt
+            if keys[pygame.K_PERIOD]: sel.rot.y -= 1.6*dt
         else:
-            ui_label(screen, 12, 585, "No selection")
+            ui_label(screen, 12, 585, "No selection", 14)
+
+        # Camera controls (viewport only)
+        keys = pygame.key.get_pressed()
+        sp = 7.0 * dt
+        if keys[pygame.K_a]: cam.pos.x -= sp
+        if keys[pygame.K_d]: cam.pos.x += sp
+        if keys[pygame.K_w]: cam.pos.z -= sp
+        if keys[pygame.K_s]: cam.pos.z += sp
+        if keys[pygame.K_q]: cam.pos.y -= sp
+        if keys[pygame.K_e]: cam.pos.y += sp
+        if keys[pygame.K_KP4]: cam.yaw += 1.6*dt
+        if keys[pygame.K_KP6]: cam.yaw -= 1.6*dt
+        if keys[pygame.K_KP8]: cam.pitch += 1.2*dt
+        if keys[pygame.K_KP2]: cam.pitch -= 1.2*dt
+        cam.pitch = clamp(cam.pitch, -1.2, 1.2)
 
         pygame.display.flip()
 
+    pygame.quit()
 
-# -------------------- Game runtime --------------------
+# -------------------------- Game runtime --------------------------
+def apply_controller(scene: Scene, keys, action_keys, dt: float):
+    # basic "character" for entity named Player if has Controller component or Script
+    player = next((e for e in scene.entities if e.name == "Player"), None)
+    if not player:
+        return
+    speed = 3.0
+    if "Controller" in player.components:
+        speed = float(player.components["Controller"].get("speed", 3.0))
+
+    def down(action): 
+        k = action_keys.get(action, pygame.K_UNKNOWN)
+        return k != pygame.K_UNKNOWN and keys[k]
+
+    dx = dz = dy = 0.0
+    if down("Forward"): dz -= speed * dt
+    if down("Back"): dz += speed * dt
+    if down("Left"): dx -= speed * dt
+    if down("Right"): dx += speed * dt
+    if down("Up"): dy += speed * dt
+    if down("Down"): dy -= speed * dt
+
+    player.pos.x += dx
+    player.pos.y += dy
+    player.pos.z += dz
+
 def run_game(project_root: str = "."):
     pygame.init()
     pygame.font.init()
-    screen = pygame.display.set_mode((1100, 700))
-    pygame.display.set_caption("RagnarEngine Game (from scratch)")
-    clock = pygame.time.Clock()
 
-    scene_path = os.path.join(project_root, "scene.json")
-    scene = load_scene(scene_path) if os.path.exists(scene_path) else Scene(entities=[Entity(id=1, name="Cube")])
+    project = load_json(os.path.join(project_root, "project.json"), dict(DEFAULT_PROJECT))
+    main_scene = os.path.join(project_root, project.get("main_scene","scene.json"))
+    scene = load_scene(main_scene) if os.path.exists(main_scene) else Scene(name="Scene", entities=[Entity(1,"Cube")])
 
+    action_keys = build_bindings(project)
     cam = Camera()
+    w, h = 1100, 700
+    screen = pygame.display.set_mode((w,h))
+    pygame.display.set_caption("RagnarEngine Game V2")
+    clock = pygame.time.Clock()
     pygame.mouse.set_visible(False)
     pygame.event.set_grab(True)
     pygame.mouse.get_rel()
 
-    while True:
-        dt = clock.tick(120) / 1000.0
+    # load script files once
+    script_cache: Dict[str,str] = {}
+    def get_script_text(rel_path: str) -> str:
+        rel_path = rel_path.replace("\\","/")
+        if rel_path in script_cache:
+            return script_cache[rel_path]
+        path = os.path.join(project_root, rel_path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read()
+        except Exception:
+            txt = ""
+        script_cache[rel_path] = txt
+        return txt
+
+    running = True
+    while running:
+        dt = clock.tick(120)/1000.0
+        fps = clock.get_fps()
+
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
-                pygame.quit(); return
-            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                pygame.quit(); return
+                running = False
+            elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                running = False
 
         mx, my = pygame.mouse.get_rel()
         cam.yaw -= mx * 0.004
@@ -307,23 +1013,50 @@ def run_game(project_root: str = "."):
         cam.pitch = clamp(cam.pitch, -1.2, 1.2)
 
         keys = pygame.key.get_pressed()
-        sp = 7.0 * (2.0 if keys[pygame.K_LSHIFT] else 1.0)
-        if keys[pygame.K_w]: cam.pos.z -= sp*dt
-        if keys[pygame.K_s]: cam.pos.z += sp*dt
-        if keys[pygame.K_a]: cam.pos.x -= sp*dt
-        if keys[pygame.K_d]: cam.pos.x += sp*dt
-        if keys[pygame.K_SPACE]: cam.pos.y += sp*dt
-        if keys[pygame.K_LCTRL]: cam.pos.y -= sp*dt
+        apply_controller(scene, keys, action_keys, dt)
 
-        screen.fill((10,10,14))
-        # spin cubes a bit so it's alive
+        # R# scripts
+        rt = RSharpRuntime(scene, keys, action_keys)
         for e in scene.entities:
-            e.rot.y += 0.8 * dt
-            draw_wire_cube(screen, cam, e, color=(80,200,255))
+            sc = e.components.get("Script")
+            if isinstance(sc, dict) and sc.get("file"):
+                txt = get_script_text(sc["file"])
+                if txt:
+                    rsharp_execute(txt, rt, dt)
 
-        # fps
-        fps = clock.get_fps()
+        # render
+        screen.fill((10,10,14))
+        fov = float(project.get("render",{}).get("fov", 75.0))
+        mode = (project.get("render",{}).get("mode","WIRE") or "WIRE").upper()
+
+        for e in scene.entities:
+            col = (80,200,255)
+            if mode == "FILL":
+                draw_entity_fill(screen, cam, e, fov, base_color=col)
+                draw_entity_wire(screen, cam, e, fov, color=(10,10,10))
+            else:
+                draw_entity_wire(screen, cam, e, fov, color=col)
+
         font = pygame.font.SysFont("consolas", 16)
-        screen.blit(font.render(f"FPS: {fps:5.1f}  ESC quit", True, (230,230,240)), (10,10))
+        screen.blit(font.render(f"FPS: {fps:5.1f} | Layout: {project.get('input',{}).get('layout','AUTO')} | ESC quit", True, (230,230,240)), (10,10))
         pygame.display.flip()
+
+    pygame.quit()
+
+# -------------------------- CLI entry --------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--editor", type=str, default=None, help="project dir")
+    ap.add_argument("--game", type=str, default=None, help="project dir")
+    args = ap.parse_args()
+
+    if args.editor:
+        run_editor(args.editor)
+    elif args.game:
+        run_game(args.game)
+    else:
+        print("Usage:\n  python ragnarengine.py --editor <project>\n  python ragnarengine.py --game <project>")
+
+if __name__ == "__main__":
+    main()
 
